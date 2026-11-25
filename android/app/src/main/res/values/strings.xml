@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Kidpool</string>
+    <string name="title_activity_main">Kidpool</string>
+    <string name="package_name">com.techtool4u.kidpool</string>
+    <string name="custom_url_scheme">com.techtool4u.kidpool</string>
+</resources>

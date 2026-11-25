@@ -1,0 +1,10 @@
+{
+  "appId": "com.techtool4u.kidpool",
+  "appName": "Kidpool",
+  "webDir": "dist",
+  "plugins": {
+    "LocalNotifications": {
+      "iconColor": "#F5B700"
+    }
+  }
+}
