@@ -146,3 +146,4 @@ dialog h2 { margin-bottom: 4px; }
 @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
 .list > button.li { width: 100%; border: 0; background: none; text-align: left; cursor: pointer; padding: 6px 0; }
 .list > button.li + button.li { border-top: 1px solid var(--line-soft); }
+.invite-code { font: 700 22px/1 var(--display); letter-spacing: .12em; }

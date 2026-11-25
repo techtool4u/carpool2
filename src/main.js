@@ -52,6 +52,8 @@ function kidNames(ids) { return ids.map((id) => S.kid(id)?.name).filter(Boolean)
 // ---------- router ----------
 const routes = { today: viewToday, schedule: viewSchedule, live: viewLive, alerts: viewAlerts, group: viewGroup, trip: viewTripForm };
 let cleanup = null;
+let currentRoute = 'today';
+let liveKey = '';
 let weekOffset = 0;
 let mineOnly = false;
 
@@ -59,6 +61,8 @@ function route() {
   const [name, arg] = (location.hash.replace(/^#/, '') || 'today').split('/');
   if (cleanup) { cleanup(); cleanup = null; }
   const fn = routes[name] || viewToday;
+  currentRoute = routes[name] ? name : 'today';
+  liveKey = '';
   const view = $('#view');
   view.innerHTML = '';
   const res = fn(view, arg);
@@ -74,7 +78,13 @@ function renderTabs(active) {
 }
 
 window.addEventListener('hashchange', route);
-S.subscribe(() => { if (!document.querySelector('dialog[open]') && !isFormRoute()) route(); });
+S.subscribe(() => {
+  if (document.querySelector('dialog[open]') || isFormRoute()) return;
+  // The driver's Live screen redraws only when the trip itself changes, so the map and GPS keep running.
+  if (currentRoute === 'live' && liveKey && liveKey === tripKey(S.get().activeTrip)) return;
+  route();
+});
+const tripKey = (a) => (a ? `${a.tripId}|${a.date}|${a.driver}` : '');
 const isFormRoute = () => location.hash.startsWith('#trip');
 
 // ---------- Today ----------
@@ -149,7 +159,7 @@ function viewToday(el) {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.start) startTrip(b.dataset.start, date);
-    if (b.dataset.claim) { S.setDriver(b.dataset.claim, date, s.me); toast('You’re driving this one.'); P.scheduleTurnReminders(); }
+    if (b.dataset.claim) { S.setDriver(b.dataset.claim, date, s.me); S.tellGroup('allChanges', 'Driver found', `${S.family(s.me)?.name} will drive ${S.trip(b.dataset.claim)?.name} today.`); toast('You’re driving this one.'); P.scheduleTurnReminders(); }
     if (b.dataset.swapYes) answerSwap(b.dataset.swapYes, true);
     if (b.dataset.swapNo) answerSwap(b.dataset.swapNo, false);
   };
@@ -166,15 +176,18 @@ function answerSwap(id, yes) {
   });
   const t = S.trip(w.tripId);
   P.notifyNow(yes ? 'Swap accepted' : 'Swap declined', `${t.name} on ${w.date}: ${yes ? 'you’re driving now' : S.family(w.from)?.name + ' still drives'}.`);
+  S.tellGroup('swaps', yes ? 'Swap accepted' : 'Swap declined', `${S.family(w.to)?.name} ${yes ? 'will drive' : 'can’t drive'} ${t.name} on ${w.date}.`, w.from);
   P.scheduleTurnReminders();
 }
 
 // ---------- trips: start / end ----------
 async function startTrip(tripId, date) {
   const s = S.get();
-  S.update((st) => { st.activeTrip = { tripId, date, driver: s.me, startedAt: Date.now(), picked: {}, path: [], lastPos: null }; });
+  S.clearLivePos();
+  S.update((st) => { st.activeTrip = { tripId, date, driver: s.me, startedAt: Date.now(), picked: {} }; });
   const t = S.trip(tripId);
   if (s.settings.tripStarted) P.notifyNow('Trip started', `${S.family(s.me).name} is on the way: ${t.name}.`);
+  S.tellGroup('tripStarted', 'Trip started', `${S.family(s.me).name} is on the way: ${t.name}. Open Live to follow.`);
   location.hash = '#live';
 }
 
@@ -184,12 +197,14 @@ function endTrip() {
   if (!a) return;
   const t = S.trip(a.tripId);
   P.stopWatching();
+  S.clearLivePos();
   S.update((st) => {
     st.doneTrips = st.doneTrips || {};
     st.doneTrips[`${a.tripId}:${a.date}`] = Date.now();
     st.activeTrip = null;
   });
   P.notifyNow('Arrived', `${t?.name ?? 'Trip'} finished. Location sharing stopped.`);
+  S.tellGroup('kidUpdates', 'Arrived', `${S.family(a.driver)?.name} arrived: ${t?.name ?? 'trip'} is done.`);
   location.hash = '#today';
 }
 
@@ -213,6 +228,9 @@ function viewLive(el) {
 
   const t = S.trip(a.tripId);
   const driver = S.family(a.driver);
+  const isDriver = a.driver === s.me;
+  liveKey = isDriver ? tripKey(a) : '';
+  if (!t) return void (el.innerHTML = '<header class="head"><h1>Live trip</h1></header><p class="muted">This trip was deleted.</p>');
   const place = S.place(t.placeId);
   const tm = S.fmtTime(t.time);
   el.innerHTML = `
@@ -221,14 +239,14 @@ function viewLive(el) {
       ${avatar(driver)}
     </header>
     <div id="map" class="map" role="img" aria-label="Map showing the driver’s location"></div>
-    <p class="tiny muted" id="loc-status" style="margin:-8px 0 0">Finding your location…</p>
+    <p class="tiny muted" id="loc-status" style="margin:-8px 0 0">${isDriver ? 'Finding your location…' : `Waiting for ${esc(driver?.name)}’s location…`}</p>
     <section class="card">
       <div class="row-between" style="margin-bottom:6px"><h2>${esc(driver?.name)} · ${esc(driver?.car ?? '')}</h2><span class="small muted">due ${tm.time} ${tm.ap}</span></div>
       <ol class="stops">
         ${t.kidIds.map((id) => {
           const k = S.kid(id); const at = a.picked[id];
           return `<li class="stop">
-            <button class="check" role="checkbox" aria-checked="${at ? 'true' : 'false'}" aria-label="${esc(k?.name)} picked up" data-kid="${id}">${at ? icon('check') : ''}</button>
+            <button class="check" role="checkbox" aria-checked="${at ? 'true' : 'false'}" aria-label="${esc(k?.name)} picked up" data-kid="${id}" ${isDriver ? '' : 'disabled'}>${at ? icon('check') : ''}</button>
             <span><b>${esc(k?.name)}</b>${k?.booster ? ' <span class="small muted">· booster</span>' : ''}${k?.allergies ? ` <span class="small muted">· ${esc(k.allergies)} allergy</span>` : ''}</span>
             <span class="small muted">${at ? new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'waiting'}</span>
           </li>`;
@@ -236,48 +254,68 @@ function viewLive(el) {
         <li class="stop"><span></span><span><b>${esc(place?.name ?? 'Destination')}</b></span><span class="small muted">${esc(place?.note ?? '')}</span></li>
       </ol>
     </section>
-    <div class="btns">
+    ${isDriver ? `<div class="btns">
       <button class="btn dark" data-arrived>Arrived</button>
       <button class="btn" data-late>Running late</button>
-    </div>
-    <p class="tiny muted" style="margin:0">In this version your location shows on this phone only. Sharing it with the other families needs the group sync described in the README.</p>`;
+    </div>` : `${driver?.phone ? `<a class="btn block" href="tel:${esc(driver.phone)}">Call ${esc(driver.name)}</a>` : ''}`}
+    <p class="tiny muted" style="margin:0">${S.groupInfo()
+      ? (isDriver ? 'The families in your group see your location until you tap Arrived.' : `${esc(driver?.name)}’s location is shared only during this trip.`)
+      : 'Your location shows on this phone only. To share it with the other families, set up a shared group under Group.'}</p>`;
 
   // map
   const map = L.map($('#map', el), { zoomControl: false, attributionControl: true }).setView([39.5, -98.35], 4);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
-  const line = L.polyline((a.path || []).map((p) => [p.lat, p.lng]), { color: '#1E40AF', weight: 5 }).addTo(map);
+  const line = L.polyline([], { color: '#1E40AF', weight: 5 }).addTo(map);
   const marker = L.circleMarker([0, 0], { radius: 10, color: '#fff', weight: 3, fillColor: '#1E40AF', fillOpacity: 1 });
   let first = true;
   let alive = true;
-  if (a.lastPos) { marker.setLatLng([a.lastPos.lat, a.lastPos.lng]).addTo(map); map.setView([a.lastPos.lat, a.lastPos.lng], 15); first = false; }
-
   const status = $('#loc-status', el);
-  P.startWatching((pos) => {
-    if (!alive) return;
+  const show = (pos) => {
+    if (!alive || !pos) return;
     marker.setLatLng([pos.lat, pos.lng]);
     if (!map.hasLayer(marker)) marker.addTo(map);
-    line.addLatLng([pos.lat, pos.lng]);
+    if (pos.path) line.setLatLngs(pos.path.map((p) => [p.lat, p.lng]));
     if (first) { map.setView([pos.lat, pos.lng], 15); first = false; } else map.panTo([pos.lat, pos.lng], { animate: false });
-    status.textContent = `Live · updated ${new Date(pos.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })} · ±${Math.round(pos.acc)} m`;
-    // save without re-rendering the screen
-    const st = S.get();
-    if (st.activeTrip) { st.activeTrip.lastPos = pos; st.activeTrip.path.push({ lat: pos.lat, lng: pos.lng }); st.activeTrip.path = st.activeTrip.path.slice(-500); try { localStorage.setItem('kidpool:v1', JSON.stringify(st)); } catch (e) { /* ignore */ } }
-  }, (err) => { status.textContent = err.message || 'Couldn’t get your location.'; });
+    status.textContent = `Live · updated ${new Date(pos.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}${pos.acc ? ` · ±${Math.round(pos.acc)} m` : ''}`;
+  };
+  show(S.getLivePos());
+
+  let stopPos = () => {};
+  if (isDriver) {
+    P.startWatching((pos) => { if (!alive) return; S.setLivePos(pos); show(S.getLivePos()); },
+      (err) => { status.textContent = err.message || 'Couldn’t get your location.'; });
+  } else {
+    stopPos = S.onLivePos(show);
+    if (!S.groupInfo()) status.textContent = `${driver?.name} is driving. Their location shows on their phone only until you set up a shared group.`;
+  }
   setTimeout(() => { if (alive) map.invalidateSize(); }, 50);
 
   el.onclick = (e) => {
     const b = e.target.closest('button');
     if (!b) return;
-    if (b.dataset.kid) {
+    if (b.dataset.kid && isDriver) {
       const id = b.dataset.kid;
       const was = !!S.get().activeTrip.picked[id];
       S.update((st) => { if (was) delete st.activeTrip.picked[id]; else st.activeTrip.picked[id] = Date.now(); });
       if (!was && S.get().settings.kidUpdates) P.notifyNow(`${S.kid(id).name} was picked up`, `${driver.name} picked up ${S.kid(id).name}.`);
+      if (!was) S.tellGroup('kidUpdates', `${S.kid(id).name} was picked up`, `${driver.name} picked up ${S.kid(id).name} for ${t.name}.`);
+      paintKid(b, S.get().activeTrip?.picked[id]);
     }
-    if (b.hasAttribute('data-arrived')) endTrip();
-    if (b.hasAttribute('data-late')) { P.notifyNow('Running late', `${driver.name} is running about 10 minutes late for ${t.name}.`); toast('Group told you’re running late.'); }
+    if (b.hasAttribute('data-arrived') && isDriver) endTrip();
+    if (b.hasAttribute('data-late') && isDriver) {
+      P.notifyNow('Running late', `${driver.name} is running about 10 minutes late for ${t.name}.`);
+      S.tellGroup('late', 'Running late', `${driver.name} is running about 10 minutes late for ${t.name}.`);
+      toast(S.groupInfo() ? 'Group told you’re running late.' : 'Noted. Set up a shared group so the other families get this.');
+    }
   };
-  return () => { alive = false; P.stopWatching(); map.off(); map.remove(); };
+  return () => { alive = false; stopPos(); if (isDriver) P.stopWatching(); map.off(); map.remove(); };
+}
+
+function paintKid(btn, at) {
+  btn.setAttribute('aria-checked', at ? 'true' : 'false');
+  btn.innerHTML = at ? icon('check') : '';
+  const when = btn.closest('.stop')?.lastElementChild;
+  if (when) when.textContent = at ? new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'waiting';
 }
 
 // ---------- Schedule ----------
@@ -375,9 +413,11 @@ function slotSheet(tripId, iso) {
         S.update((st) => st.swaps.push({ id: S.uid(), tripId, date: iso, from: st.me, to: fam, status: 'pending' }));
         toast(`Swap request sent to ${S.family(fam).name}.`);
         S.addFeed('Swap requested', `You asked ${S.family(fam).name} to cover ${t.name} on ${d}.`);
+        S.tellGroup('swaps', 'Swap request', `${S.family(S.get().me)?.name} asks if you can drive ${t.name} on ${d}. Open Today to answer.`, fam);
       } else {
         S.setDriver(tripId, iso, fam);
         if (S.get().settings.allChanges) P.notifyNow('Schedule changed', `${t.name} on ${d}: ${fam ? S.family(fam).name : 'nobody yet'}.`);
+        S.tellGroup('allChanges', 'Schedule changed', `${t.name} on ${d}: ${fam ? S.family(fam).name + ' drives' : 'needs a driver'} (changed by ${S.family(S.get().me)?.name}).`);
         toast('Schedule updated.');
       }
       P.scheduleTurnReminders();
@@ -440,6 +480,7 @@ function viewTripForm(el, id) {
     if (b.hasAttribute('data-delete')) {
       if (confirm(`Delete ${existing.name}? This removes it for everyone in the group.`)) {
         S.update((st) => { st.trips = st.trips.filter((t) => t.id !== existing.id); });
+        S.tellGroup('allChanges', 'Trip removed', `${S.family(S.get().me)?.name} removed ${existing.name}.`);
         toast('Trip deleted.'); location.hash = '#schedule';
       }
       return;
@@ -468,6 +509,7 @@ function viewTripForm(el, id) {
       const i = st.trips.findIndex((t) => t.id === draft.id);
       if (i >= 0) st.trips[i] = draft; else st.trips.push(draft);
     });
+    S.tellGroup('allChanges', existing ? 'Trip updated' : 'New trip added', `${S.family(S.get().me)?.name} ${existing ? 'changed' : 'added'} ${draft.name}.`);
     P.notifyNow(existing ? 'Trip updated' : 'New trip added', `${draft.name}, ${draft.days.map((d) => S.DAY_NAMES[d].slice(0, 3)).join(', ')} at ${S.fmtTime(draft.time).time} ${S.fmtTime(draft.time).ap}.`);
     P.scheduleTurnReminders();
     location.hash = '#schedule';
@@ -546,7 +588,8 @@ function viewGroup(el) {
       <h2>Places</h2>
       <div class="list">${s.places.map((p) => `<div class="li"><span>${esc(p.name)}</span><span class="small muted">${esc(p.note)}</span></div>`).join('')}</div>
     </section>
-    <button class="btn block" data-reset>Reset to demo data</button>`;
+    ${shareSectionHTML()}
+    ${S.groupInfo() ? '' : '<button class="btn block" data-reset>Reset to demo data</button>'}`;
 
   el.onchange = (e) => { if (e.target.id === 'me') { S.update((st) => { st.me = e.target.value; }); P.scheduleTurnReminders(); } };
   el.onclick = (e) => {
@@ -554,8 +597,86 @@ function viewGroup(el) {
     if (!b) return;
     if (b.dataset.fam) familySheet(b.dataset.fam);
     if (b.dataset.kid) kidSheet(b.dataset.kid);
+    if (b.hasAttribute('data-create')) createGroup(b);
+    if (b.hasAttribute('data-join')) joinGroup();
+    if (b.hasAttribute('data-invite')) shareInvite();
+    if (b.hasAttribute('data-leave')) leaveGroup();
     if (b.hasAttribute('data-reset') && confirm('Reset everything to the demo data? Your changes on this device will be lost.')) { S.resetDemo(); toast('Demo data restored.'); }
   };
+}
+
+// ---------- sharing between phones ----------
+function shareSectionHTML() {
+  const g = S.groupInfo();
+  if (!S.sharingAvailable) {
+    return `<section class="card section" aria-label="Sharing"><h2>Share with the other families</h2>
+      <p class="small muted" style="margin:0">This build keeps everything on this phone. Sharing needs the Supabase settings described in the README.</p></section>`;
+  }
+  if (!g) {
+    return `<section class="card section" aria-label="Sharing"><h2>Share with the other families</h2>
+      <p class="small muted" style="margin:0">Right now this schedule is only on this phone. Make it a shared group so every family sees the same schedule, live location and alerts.</p>
+      <div class="btns"><button class="btn dark" data-create>Create shared group</button><button class="btn" data-join>Join with a code</button></div>
+      <p class="tiny muted" style="margin:0">One parent creates the group from their schedule; the others join with its code.</p></section>`;
+  }
+  const label = { live: 'Synced', connecting: 'Connecting…', offline: 'Offline: changes will sync when you’re back online', off: '' }[S.syncStatus];
+  return `<section class="card section" aria-label="Sharing"><div class="row-between"><h2>Shared group</h2><span class="tiny muted">${esc(g.pending && S.syncStatus === 'live' ? 'Saving…' : label)}</span></div>
+    <p style="margin:0">Invite code <b class="invite-code">${esc(g.code)}</b></p>
+    <p class="small muted" style="margin:0">Other parents install Kidpool, tap Group › Join with a code, and choose who they are.</p>
+    <div class="btns"><button class="btn dark" data-invite>Send invite</button><button class="btn" data-leave>Leave group</button></div></section>`;
+}
+
+async function createGroup(btn) {
+  if (!confirm('Share this schedule (families, kids, places and trips) with the other families? You’ll get an invite code to send them.')) return;
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    await S.createSharedGroup();
+    toast('Shared group created. Send the invite to the other families.');
+    route();
+    shareInvite();
+  } catch (e) {
+    toast(`Couldn’t create the group: ${e.message}`);
+    route();
+  }
+}
+
+async function joinGroup() {
+  const code = prompt('Type the invite code another parent sent you');
+  if (!code || !code.trim()) return;
+  if (!confirm('Joining replaces the schedule on this phone with the group’s schedule. Continue?')) return;
+  toast('Joining…');
+  try {
+    await S.joinSharedGroup(code);
+    P.scheduleTurnReminders();
+    whoAmISheet();
+  } catch (e) {
+    toast(e.message.includes('No group') ? 'No group has that code. Check it and try again.' : `Couldn’t join: ${e.message}`);
+  }
+}
+
+function whoAmISheet() {
+  const s = S.get();
+  formSheet('You joined the group. Who are you?', `
+    <div class="field"><label for="wa-me">I am</label><select id="wa-me" name="me" class="input">${s.families.map((f) => `<option value="${f.id}" ${f.id === s.me ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}</select></div>
+    <p class="small muted" style="margin:0">Your family isn’t listed? Pick any name, then edit it under Families.</p>`,
+  (fd) => { S.update((st) => { st.me = fd.get('me'); }); P.scheduleTurnReminders(); });
+}
+
+async function shareInvite() {
+  const g = S.groupInfo();
+  if (!g) return;
+  const web = 'https://techtool4u.github.io/carpool2/';
+  const text = `Join our carpool on Kidpool. Install the app (or open ${web}), go to Group › Join with a code, and type ${g.code}.`;
+  try {
+    if (navigator.share) { await navigator.share({ title: 'Join our Kidpool carpool', text }); return; }
+  } catch (e) { if (e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(text); toast('Invite copied. Paste it into your group chat.'); } catch (e) { prompt('Copy this invite and send it to the other families', text); }
+}
+
+async function leaveGroup() {
+  if (!confirm('Stop sharing with this group? This phone keeps its copy of the schedule but won’t get changes anymore.')) return;
+  await S.leaveSharedGroup();
+  toast('You left the group.');
+  route();
 }
 
 function formSheet(title, fieldsHTML, onSave) {
@@ -600,5 +721,13 @@ function kidSheet(id) {
 }
 
 // ---------- boot ----------
+// Alerts sent by other phones in the group.
+S.onGroupEvent((e) => P.notifyNow(e.title, e.body));
+// Another phone changed the shared data, or the connection status changed.
+// (The screen itself redraws through S.subscribe above.)
+S.onRemoteChange((info) => {
+  if (info.data) P.scheduleTurnReminders();
+  if (info.status && currentRoute === 'group' && !document.querySelector('dialog[open]')) route();
+});
 route();
 P.scheduleTurnReminders();

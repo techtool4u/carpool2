@@ -46,6 +46,11 @@ jobs:
 
       - name: Build the web app
         run: npm run build:web
+        env:
+          # Supabase project settings (Settings › Secrets and variables › Actions › Variables).
+          # Without them the app keeps data on each phone only.
+          VITE_SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
 
       - name: Copy it into the Android project
         run: npx cap sync android
