@@ -184,7 +184,7 @@ function answerSwap(id, yes) {
 async function startTrip(tripId, date) {
   const s = S.get();
   S.clearLivePos();
-  S.update((st) => { st.activeTrip = { tripId, date, driver: s.me, startedAt: Date.now(), picked: {} }; });
+  S.update((st) => { st.activeTrip = { tripId, date, driver: s.me, device: S.deviceId, startedAt: Date.now(), picked: {} }; });
   const t = S.trip(tripId);
   if (s.settings.tripStarted) P.notifyNow('Trip started', `${S.family(s.me).name} is on the way: ${t.name}.`);
   S.tellGroup('tripStarted', 'Trip started', `${S.family(s.me).name} is on the way: ${t.name}. Open Live to follow.`);
@@ -228,7 +228,7 @@ function viewLive(el) {
 
   const t = S.trip(a.tripId);
   const driver = S.family(a.driver);
-  const isDriver = a.driver === s.me;
+  const isDriver = S.isDrivingPhone(a);
   liveKey = isDriver ? tripKey(a) : '';
   if (!t) return void (el.innerHTML = '<header class="head"><h1>Live trip</h1></header><p class="muted">This trip was deleted.</p>');
   const place = S.place(t.placeId);
@@ -413,6 +413,7 @@ function slotSheet(tripId, iso) {
         S.update((st) => st.swaps.push({ id: S.uid(), tripId, date: iso, from: st.me, to: fam, status: 'pending' }));
         toast(`Swap request sent to ${S.family(fam).name}.`);
         S.addFeed('Swap requested', `You asked ${S.family(fam).name} to cover ${t.name} on ${d}.`);
+        S.tellFamily('Swap requested', `${S.family(S.get().me)?.name} asked ${S.family(fam).name} to cover ${t.name} on ${d}.`);
         S.tellGroup('swaps', 'Swap request', `${S.family(S.get().me)?.name} asks if you can drive ${t.name} on ${d}. Open Today to answer.`, fam);
       } else {
         S.setDriver(tripId, iso, fam);
@@ -575,7 +576,7 @@ function viewGroup(el) {
           ${avatar(f)}
           <div class="what"><b>${esc(f.name)}${f.id === s.me ? ' (you)' : ''}</b>
             <span class="small muted">Kids: ${esc(s.kids.filter((k) => k.familyId === f.id).map((k) => k.name).join(', ') || 'none')}</span>
-            <span class="tiny muted">${esc(f.car)} · ${f.seats} seats</span></div>
+            <span class="tiny muted">${esc(f.car)} · ${f.seats} seats${S.groupInfo() && S.phonesFor(f.id) > 1 ? ` · ${S.phonesFor(f.id)} phones` : ''}</span></div>
           ${f.phone ? `<a class="btn round ghost" href="tel:${esc(f.phone)}" aria-label="Call ${esc(f.name)}">${icon('phone')}</a>` : ''}
           <button class="btn round ghost" data-fam="${f.id}" aria-label="Edit ${esc(f.name)}">${icon('fwd')}</button>
         </article>`).join('')}
@@ -591,7 +592,7 @@ function viewGroup(el) {
     ${shareSectionHTML()}
     ${S.groupInfo() ? '' : '<button class="btn block" data-reset>Reset to demo data</button>'}`;
 
-  el.onchange = (e) => { if (e.target.id === 'me') { S.update((st) => { st.me = e.target.value; }); P.scheduleTurnReminders(); } };
+  el.onchange = (e) => { if (e.target.id === 'me') { S.update((st) => { st.me = e.target.value; }); S.registerPhone(); P.scheduleTurnReminders(); } };
   el.onclick = (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -600,6 +601,7 @@ function viewGroup(el) {
     if (b.hasAttribute('data-create')) createGroup(b);
     if (b.hasAttribute('data-join')) joinGroup();
     if (b.hasAttribute('data-invite')) shareInvite();
+    if (b.hasAttribute('data-fam-invite')) shareFamilyInvite();
     if (b.hasAttribute('data-leave')) leaveGroup();
     if (b.hasAttribute('data-reset') && confirm('Reset everything to the demo data? Your changes on this device will be lost.')) { S.resetDemo(); toast('Demo data restored.'); }
   };
@@ -622,7 +624,9 @@ function shareSectionHTML() {
   return `<section class="card section" aria-label="Sharing"><div class="row-between"><h2>Shared group</h2><span class="tiny muted">${esc(g.pending && S.syncStatus === 'live' ? 'Saving…' : label)}</span></div>
     <p style="margin:0">Invite code <b class="invite-code">${esc(g.code)}</b></p>
     <p class="small muted" style="margin:0">Other parents install Kidpool, tap Group › Join with a code, and choose who they are.</p>
-    <div class="btns"><button class="btn dark" data-invite>Send invite</button><button class="btn" data-leave>Leave group</button></div></section>`;
+    <div class="btns"><button class="btn dark" data-invite>Invite a family</button><button class="btn" data-leave>Leave group</button></div>
+    <button class="btn block" data-fam-invite>Add a parent to ${esc(S.family(S.get().me)?.name ?? 'my')}’s family</button>
+    <p class="tiny muted" style="margin:0">A second parent’s phone joins your family, not as a new family: same turns, reminders and activity.</p></section>`;
 }
 
 async function createGroup(btn) {
@@ -645,9 +649,9 @@ async function joinGroup() {
   if (!confirm('Joining replaces the schedule on this phone with the group’s schedule. Continue?')) return;
   toast('Joining…');
   try {
-    await S.joinSharedGroup(code);
+    const { familyId } = await S.joinSharedGroup(code);
     P.scheduleTurnReminders();
-    whoAmISheet();
+    if (familyId) { toast(`You’re in, as part of ${S.family(familyId)?.name}’s family.`); route(); } else whoAmISheet();
   } catch (e) {
     toast(e.message.includes('No group') ? 'No group has that code. Check it and try again.' : `Couldn’t join: ${e.message}`);
   }
@@ -658,7 +662,7 @@ function whoAmISheet() {
   formSheet('You joined the group. Who are you?', `
     <div class="field"><label for="wa-me">I am</label><select id="wa-me" name="me" class="input">${s.families.map((f) => `<option value="${f.id}" ${f.id === s.me ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}</select></div>
     <p class="small muted" style="margin:0">Your family isn’t listed? Pick any name, then edit it under Families.</p>`,
-  (fd) => { S.update((st) => { st.me = fd.get('me'); }); P.scheduleTurnReminders(); });
+  (fd) => { S.update((st) => { st.me = fd.get('me'); }); S.registerPhone(); P.scheduleTurnReminders(); });
 }
 
 async function shareInvite() {
@@ -672,6 +676,17 @@ async function shareInvite() {
   try { await navigator.clipboard.writeText(text); toast('Invite copied. Paste it into your group chat.'); } catch (e) { prompt('Copy this invite and send it to the other families', text); }
 }
 
+async function shareFamilyInvite() {
+  const code = S.familyInviteCode();
+  if (!code) return;
+  const name = S.family(S.get().me)?.name;
+  const text = `Join ${name}’s family on our Kidpool carpool. Install the app (or open https://techtool4u.github.io/carpool2/), go to Group › Join with a code, and type ${code}. Your phone will be set up as part of ${name}’s family.`;
+  try {
+    if (navigator.share) { await navigator.share({ title: 'Join our family on Kidpool', text }); return; }
+  } catch (e) { if (e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(text); toast('Family invite copied. Send it to the other parent.'); } catch (e) { prompt('Copy this and send it to the other parent', text); }
+}
+
 async function leaveGroup() {
   if (!confirm('Stop sharing with this group? This phone keeps its copy of the schedule but won’t get changes anymore.')) return;
   await S.leaveSharedGroup();
@@ -679,10 +694,16 @@ async function leaveGroup() {
   route();
 }
 
-function formSheet(title, fieldsHTML, onSave) {
+// In a shared group each family looks after its own details and kid cards.
+// (Without a group, one phone sets up everything, so all of it is editable.)
+const canEdit = (familyId) => !S.groupInfo() || familyId === S.get().me;
+
+function formSheet(title, fieldsHTML, onSave, readOnlyNote = '') {
   const dlg = document.createElement('dialog');
   dlg.innerHTML = `<form method="dialog" class="section" style="gap:12px"><h2>${esc(title)}</h2>${fieldsHTML}
-    <div class="btns"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn dark" value="save">Save</button></div></form>`;
+    ${readOnlyNote ? `<p class="small muted" style="margin:0">${esc(readOnlyNote)}</p><button class="btn block" value="cancel">Close</button>`
+    : '<div class="btns"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn dark" value="save">Save</button></div>'}</form>`;
+  if (readOnlyNote) dlg.querySelectorAll('input, select, textarea').forEach((x) => { x.disabled = true; });
   document.body.appendChild(dlg);
   dlg.showModal();
   dlg.addEventListener('close', () => {
@@ -694,35 +715,38 @@ function formSheet(title, fieldsHTML, onSave) {
 
 function familySheet(id) {
   const f = S.family(id);
-  formSheet(`Edit ${f.name}`, `
+  const ro = canEdit(id) ? '' : `Only ${f.name}’s family can change these details.`;
+  formSheet(ro ? f.name : `Edit ${f.name}`, `
     <div class="field"><label for="fs-name">Name</label><input id="fs-name" name="name" class="input" value="${esc(f.name)}" required></div>
     <div class="field"><label for="fs-phone">Phone</label><input id="fs-phone" name="phone" type="tel" class="input" value="${esc(f.phone)}"></div>
     <div class="two"><div class="field"><label for="fs-car">Car</label><input id="fs-car" name="car" class="input" value="${esc(f.car)}"></div>
     <div class="field"><label for="fs-seats">Seats</label><input id="fs-seats" name="seats" type="number" min="2" max="9" class="input" value="${f.seats}"></div></div>`,
-  (fd) => S.update((st) => { const x = st.families.find((y) => y.id === id); x.name = fd.get('name').trim() || x.name; x.phone = fd.get('phone').trim(); x.car = fd.get('car').trim(); x.seats = Number(fd.get('seats')) || x.seats; }));
+  (fd) => canEdit(id) && S.update((st) => { const x = st.families.find((y) => y.id === id); x.name = fd.get('name').trim() || x.name; x.phone = fd.get('phone').trim(); x.car = fd.get('car').trim(); x.seats = Number(fd.get('seats')) || x.seats; }), ro);
 }
 
 function kidSheet(id) {
   const s = S.get();
   const k = id === 'new' ? { id: S.uid(), name: '', familyId: s.me, booster: false, allergies: '', notes: '' } : S.kid(id);
-  formSheet(id === 'new' ? 'Add a kid' : `Edit ${k.name}`, `
+  const ro = canEdit(k.familyId) ? '' : `Only ${S.family(k.familyId)?.name}’s family can change ${k.name}’s card.`;
+  const famChoices = S.groupInfo() && !ro ? s.families.filter((f) => f.id === s.me) : s.families;
+  formSheet(id === 'new' ? 'Add a kid' : ro ? k.name : `Edit ${k.name}`, `
     <div class="field"><label for="ks-name">Name</label><input id="ks-name" name="name" class="input" value="${esc(k.name)}" required></div>
-    <div class="field"><label for="ks-fam">Family</label><select id="ks-fam" name="familyId" class="input">${s.families.map((f) => `<option value="${f.id}" ${f.id === k.familyId ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}</select></div>
+    <div class="field"><label for="ks-fam">Family</label><select id="ks-fam" name="familyId" class="input">${famChoices.map((f) => `<option value="${f.id}" ${f.id === k.familyId ? 'selected' : ''}>${esc(f.name)}</option>`).join('')}</select></div>
     <label class="li" style="min-height:44px"><span>Needs a booster seat</span><input type="checkbox" name="booster" ${k.booster ? 'checked' : ''} style="width:22px;height:22px"></label>
     <div class="field"><label for="ks-all">Allergies</label><input id="ks-all" name="allergies" class="input" value="${esc(k.allergies)}"></div>
     <div class="field"><label for="ks-notes">Notes for drivers</label><textarea id="ks-notes" name="notes" class="input" rows="2">${esc(k.notes)}</textarea></div>`,
   (fd) => S.update((st) => {
     const name = fd.get('name').trim();
-    if (!name) return;
+    if (!name || !canEdit(k.familyId) || !canEdit(fd.get('familyId'))) return;
     const data = { id: k.id, name, familyId: fd.get('familyId'), booster: fd.get('booster') === 'on', allergies: fd.get('allergies').trim(), notes: fd.get('notes').trim() };
     const i = st.kids.findIndex((x) => x.id === k.id);
     if (i >= 0) st.kids[i] = data; else st.kids.push(data);
-  }));
+  }), ro);
 }
 
 // ---------- boot ----------
 // Alerts sent by other phones in the group.
-S.onGroupEvent((e) => P.notifyNow(e.title, e.body));
+S.onGroupEvent((e) => (e.kind === 'family' ? S.addFeed(e.title, e.body) : P.notifyNow(e.title, e.body)));
 // Another phone changed the shared data, or the connection status changed.
 // (The screen itself redraws through S.subscribe above.)
 S.onRemoteChange((info) => {

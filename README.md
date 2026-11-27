@@ -19,6 +19,8 @@ The app starts with demo data (Jessica, Sam, Megan and Chris). Change it under *
 With a free [Supabase](https://supabase.com) project, all phones in a group share one schedule:
 
 - One parent taps **Group › Create shared group** and sends the invite code. The others tap **Join with a code** and choose who they are.
+- **Two parents, one family:** in Group, tap **Add a parent to my family** and send that code (like `ABC234-7QK2`). The second phone joins straight into your family: same turns, reminders and activity, and the family list doesn't grow. The family card shows "2 phones".
+- **Each family looks after its own details:** in a shared group you can add and edit only your own family's kids and details; other families' cards are read-only. (This is checked in the app; enforcing it on the server needs parent logins, a possible next step.)
 - Families, kids, places, trips, swaps and the running trip sync live. "I am", alert settings and the activity list stay on each phone.
 - While a trip runs, the driver's location shows on the other parents' **Live** screen (sent at most every 5 seconds, and only until *Arrived*).
 - Trip started, kid picked up, running late, arrived, swap requests and schedule changes reach the other phones as notifications **while Kidpool is open or recently used**. Alerts to a phone where the app is closed need push notifications (Firebase Cloud Messaging), the next step.

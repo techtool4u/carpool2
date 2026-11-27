@@ -61,6 +61,15 @@ function seed() {
   };
 }
 
+// Identifies this phone. Two parents of the same family share a family id but not a device id.
+export const deviceId = (() => {
+  try {
+    let d = localStorage.getItem('kidpool:device');
+    if (!d) { d = uid() + uid(); localStorage.setItem('kidpool:device', d); }
+    return d;
+  } catch (e) { return uid() + uid(); }
+})();
+
 let state = load();
 let link = loadLink(); // { groupId, code, version, dirty } when this phone is in a shared group
 let livePos = null;   // the driver's latest position for the running trip
@@ -127,7 +136,7 @@ export const getLivePos = () => livePos;
 // (tripStarted, kidUpdates, late, allChanges, swaps); `to` limits it to one family.
 export function tellGroup(kind, title, body, to = null) {
   if (!link) return;
-  const ev = { id: uid(), kind, title, body, by: state.me, to, at: Date.now() };
+  const ev = { id: uid(), kind, title, body, by: state.me, dev: deviceId, to, at: Date.now() };
   state.seenEvents = [ev.id, ...(state.seenEvents || [])].slice(0, 100);
   update((s) => { s.events = [ev, ...(s.events || [])].slice(0, 30); });
 }
@@ -138,7 +147,7 @@ function deliverNewEvents() {
   if (!fresh.length) return;
   state.seenEvents = [...fresh.map((e) => e.id), ...(state.seenEvents || [])].slice(0, 100);
   for (const e of fresh) {
-    if (e.by === state.me || (e.to && e.to !== state.me)) continue;
+    if ((e.dev ? e.dev === deviceId : e.by === state.me) || (e.to && e.to !== state.me)) continue; // sent by this phone, or for another family
     if (Date.now() - e.at > 6 * 3600000) continue; // too old to alert about
     if (state.settings[e.kind] === false) continue;
     eventListeners.forEach((l) => l(e));
@@ -184,6 +193,7 @@ async function push() {
       remoteListeners.forEach((l) => l({ data: true }));
     }
     setStatus('live');
+    remoteListeners.forEach((l) => l({ status: true })); // "Saving…" → "Synced"
   } catch (e) {
     setStatus('offline');
     clearTimeout(pushTimer);
@@ -208,7 +218,7 @@ function takeRemote(row) {
 function takePosition(row) {
   lastPosRow = row;
   const a = state.activeTrip;
-  if (a && a.driver === state.me) return; // the driver's own phone has fresher GPS
+  if (isDrivingPhone(a)) return; // the driver's own phone has fresher GPS
   livePos = row && a && row.trip_key === `${a.tripId}:${a.date}`
     ? { lat: row.lat, lng: row.lng, acc: row.acc, at: new Date(row.at).getTime(), path: row.path || [] }
     : null;
@@ -258,24 +268,65 @@ export async function createSharedGroup() {
   state.seenEvents = (state.events || []).map((e) => e.id);
   saveLink(); save();
   await connect();
-  emit();
+  registerPhone();
   return res.code;
 }
 
+// ---------- families with more than one phone ----------
+// A family can have several phones (two parents). They share the family's turns, alerts and
+// activity; the group's family list doesn't change. Each phone is listed under state.phones.
+export function registerPhone() {
+  if (!link) return;
+  const cur = state.phones?.[deviceId];
+  if (cur && cur.familyId === state.me) return;
+  update((s) => { s.phones = { ...(s.phones || {}), [deviceId]: { familyId: s.me, at: Date.now() } }; });
+}
+export const phonesFor = (familyId) => Object.values(state.phones || {}).filter((p) => p.familyId === familyId).length;
+
+// Invite code for another parent of this family, e.g. ABC234-7QK2. Joining with it puts the
+// new phone straight into this family, with no "who are you" question.
+export function familyInviteCode() {
+  if (!link) return null;
+  let fam = state.families.find((f) => f.id === state.me);
+  if (!fam) return null;
+  if (!fam.joinCode) {
+    const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const jc = Array.from({ length: 4 }, () => A[Math.floor(Math.random() * A.length)]).join('');
+    update((s) => { const f = s.families.find((x) => x.id === s.me); if (f && !f.joinCode) f.joinCode = jc; });
+    fam = state.families.find((f) => f.id === state.me);
+  }
+  return `${link.code}-${fam.joinCode}`;
+}
+
+// Puts an activity item on the other phones of this family only, without a pop-up notification.
+export function tellFamily(title, body) { tellGroup('family', title, body, state.me); }
+
 // Replaces this phone's shared data with the group's.
+// Returns { familyId } when the code was a family invite (ABC234-7QK2), so no need to ask who they are.
 export async function joinSharedGroup(code) {
-  const res = await sync.joinGroup(code);
+  const clean = String(code).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const groupCode = clean.slice(0, 6);
+  const famCode = clean.slice(6);
+  const res = await sync.joinGroup(groupCode);
+  const fam = famCode ? (res.data.families || []).find((f) => f.joinCode === famCode) : null;
+  if (famCode && !fam) throw new Error('That family code doesn’t work anymore. Ask for a new invite.');
   link = { groupId: res.id, code: res.code, version: res.version, dirty: false };
   pending = [];
   applyShared(res.data);
+  if (fam) state.me = fam.id;
   state.seenEvents = (state.events || []).map((e) => e.id);
   saveLink(); save();
   await connect();
-  emit();
+  if (fam) registerPhone(); else emit(); // otherwise registered once they pick their family
+  return { familyId: fam?.id ?? null };
 }
 
 // Stops syncing. This phone keeps its copy of the data.
 export async function leaveSharedGroup() {
+  if (state.phones?.[deviceId]) {
+    update((s) => { delete s.phones[deviceId]; });
+    try { await push(); } catch (e) { /* offline: the entry stays, harmless */ }
+  }
   const old = link;
   link = null; pending = []; livePos = null;
   saveLink();
@@ -309,6 +360,9 @@ export function setLivePos(pos) {
   const wait = 5000 - (Date.now() - lastPosPush);
   if (wait <= 0) send(); else posTimer = setTimeout(send, wait); // at most one upload every 5 s
 }
+
+// True on the phone that started the running trip (not on other phones of the same family).
+export const isDrivingPhone = (a = state.activeTrip) => Boolean(a && a.driver === state.me && (!a.device || a.device === deviceId));
 
 export function clearLivePos() {
   clearTimeout(posTimer);
